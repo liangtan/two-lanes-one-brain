@@ -25,4 +25,4 @@ Every tunable (speeds, spawn timing, phase thresholds, colors) is a named consta
 
 ## Deployment
 
-Pushes to `main` deploy to GitHub Pages via `.github/workflows/deploy.yml`.
+GitHub Pages serves `index.html` directly from the `main` branch root — no build step, no Actions workflow. Pushes to `main` go live within a minute or two.
