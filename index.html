@@ -1,0 +1,1358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#0b0e17" />
+<title>Two Lanes, One Brain</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #0b0e17;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  #game {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    /* dvh tracks the visible viewport on mobile (URL bar collapse); the vh
+       line above is the fallback for browsers without dvh support. */
+    height: 100dvh;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+/* ============================================================================
+   TWO LANES, ONE BRAIN
+   A two-panel, two-lane reflex game. The player controls a character in the
+   left panel and a character in the right panel simultaneously, dodging
+   squares and collecting orbs that fall down each panel's two lanes.
+
+   File organization: constants -> state -> utilities -> audio -> input ->
+   spawner -> update -> render -> main loop -> boot.
+   ========================================================================== */
+
+/* ---------------------------------------------------------------------------
+   CONSTANTS
+   Every tunable literal lives here so gameplay feel can be adjusted without
+   hunting through logic.
+   ------------------------------------------------------------------------- */
+
+// localStorage keys
+const STORAGE_KEY_HIGHSCORE = "tlob-highscore";
+const STORAGE_KEY_MUTED = "tlob-muted";
+
+// String-literal "enums" (plain objects, since this file is not TypeScript).
+const GAME_MODE = {
+  MENU: "menu",
+  PLAYING: "playing",
+  HITSTOP: "hitstop",
+  GAMEOVER: "gameover",
+};
+
+const ENTITY_TYPE = {
+  SQUARE: "square",
+  ORB: "orb",
+};
+
+const SIDE = {
+  LEFT: "left",
+  RIGHT: "right",
+};
+
+// Visual direction: dark neon-minimal. Left character is cyan, right is
+// amber, kept consistent for characters, matching orbs, and UI accents.
+const COLOR_BG = "#0b0e17";
+const COLOR_BG_GRID = "rgba(255, 255, 255, 0.045)";
+const COLOR_DIVIDER = "rgba(190, 210, 255, 0.85)";
+const COLOR_LEFT = "#22d3ee";
+const COLOR_RIGHT = "#fbbf24";
+const COLOR_SQUARE = "#f5573b";
+const COLOR_TEXT = "#e8edff";
+const COLOR_TEXT_DIM = "rgba(232, 237, 255, 0.55)";
+const COLOR_VIGNETTE = "rgba(0, 0, 0, 0.6)";
+const COLOR_PANEL_BG = "rgba(6, 8, 14, 0.84)";
+const COLOR_NEAR_MISS_SPARK = "rgba(255, 255, 255, 0.9)";
+
+// Difficulty ramp: fall speed eases asymptotically from START toward CAP.
+// SPEED_RAMP_TAU_S is the exponential time constant; after ~3*tau seconds
+// (~90s at tau=30) the speed has converged to ~95% of the cap, matching the
+// "ramps smoothly toward a cap over roughly 90 seconds" spec.
+const FALL_SPEED_START = 260; // px/s
+const FALL_SPEED_CAP = 720; // px/s
+const SPEED_RAMP_TAU_S = 30;
+
+// Spawn timing. The feasibility gap is the hard floor on how close together
+// (in time) two entities may spawn on the same side, guaranteeing the player
+// always has time to react. It tightens as speed increases but never
+// vanishes.
+const SPAWN_INTERVAL_START_MS = 900;
+const SPAWN_INTERVAL_MIN_MS = 380;
+const FEASIBILITY_MIN_GAP_START_MS = 450;
+const FEASIBILITY_MIN_GAP_MIN_MS = 280;
+const SPAWN_JITTER_RATIO = 0.15;
+const SQUARE_SPAWN_WEIGHT = 0.55; // probability a spawned entity is a square
+
+// Phase thresholds, driven entirely by score.
+const PHASE2_SCORE_THRESHOLD = 15;
+const PHASE3_SCORE_THRESHOLD = 40;
+const PHASE_ANNOUNCE_DURATION_MS = 1600;
+const PHASE_ANNOUNCE_TEXT = { 2: "LANES SPLIT", 3: "TIMING SPLIT" };
+
+// Lane switching / juice timings.
+const LANE_SWITCH_TWEEN_MS = 80;
+const NEAR_MISS_WINDOW_MS = 220; // a dodge counts as "near miss" if the side switched away this recently
+const SQUASH_DURATION_MS = 180;
+const HITSTOP_DURATION_MS = 150;
+const SHAKE_DURATION_MS = 320;
+const SHAKE_MAGNITUDE_PX = 14;
+const SCORE_POP_DURATION_MS = 220;
+
+// Layout / entity geometry.
+const CHARACTER_Y_RATIO = 0.85; // character row as a fraction of panel height
+const CHARACTER_SIZE = 34;
+const COLLIDE_BAND_PX = 20; // vertical tolerance around the character row for hit/collect resolution
+const ORB_RADIUS = 12;
+const SQUARE_SIZE = 30;
+const ENTITY_SPAWN_Y = -60;
+const MUTE_TAP_REGION_PX = 64; // square tap region (top-right corner) that toggles mute; sized as a comfortable thumb target
+const GRID_LINE_SPACING_PX = 48;
+const MENU_GRID_SCROLL_SPEED = 60; // px/s, purely cosmetic idle scroll on menu
+
+// Particles.
+const PARTICLE_COLLECT_COUNT = 14;
+const PARTICLE_DEATH_COUNT = 40;
+const PARTICLE_NEAR_MISS_COUNT = 8;
+const PARTICLE_GRAVITY = 420;
+
+// Frame timing safety.
+const MAX_DT_S = 0.05; // clamp delta-time so a tab regaining focus can't cause a physics explosion
+
+// Audio.
+const AUDIO_SWITCH_FREQ = 640;
+const AUDIO_COLLECT_BASE_FREQ = 520;
+const AUDIO_COLLECT_FREQ_STEP = 14;
+const AUDIO_COLLECT_SCORE_CAP = 20; // cap how much score can raise the collect pitch
+const AUDIO_DEATH_FREQ = 90;
+
+// Fonts: sizes are "base" px at a 1200px-wide reference viewport; actual
+// draw-time size is scaled by scaledFontPx() so text stays readable on both
+// phones and ultrawide monitors. Canvas ctx.font does not support CSS
+// clamp(), so scaling is done manually in JS.
+const FONT_STACK = '"Helvetica Neue", Arial, "Segoe UI", sans-serif';
+const FONT_TITLE_BASE_PX = 46;
+const FONT_SUBTITLE_BASE_PX = 16;
+const FONT_BODY_BASE_PX = 15;
+const FONT_BODY_BOLD_BASE_PX = 17;
+const FONT_PROMPT_BASE_PX = 14;
+const FONT_HUD_SCORE_BASE_PX = 44;
+const FONT_GAMEOVER_TITLE_BASE_PX = 26;
+const FONT_GAMEOVER_SCORE_BASE_PX = 34;
+const FONT_PHASE_ANNOUNCE_BASE_PX = 22;
+
+/* ---------------------------------------------------------------------------
+   STATE
+   ------------------------------------------------------------------------- */
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+/**
+ * Creates the per-side (left/right) mutable state block: which lane the
+ * character logically occupies, the visually-tweened lane position, timers
+ * driving the squash/stretch and near-miss juice, the entities currently
+ * falling on that side, and that side's independent spawn clock (only used
+ * once phase 3 is reached).
+ */
+function createSideState(key) {
+  return {
+    key,
+    lane: 0,
+    displayLane: 0,
+    tweening: false,
+    tweenFromLane: 0,
+    tweenStartTime: -Infinity,
+    squashStartTime: -Infinity,
+    lastSwitchTime: -Infinity,
+    entities: [],
+    nextSpawnAt: 0,
+  };
+}
+
+const state = {
+  mode: GAME_MODE.MENU,
+  viewWidth: window.innerWidth,
+  viewHeight: window.innerHeight,
+  score: 0,
+  highScore: Number(localStorage.getItem(STORAGE_KEY_HIGHSCORE)) || 0,
+  isNewBest: false,
+  phase: 1,
+  elapsed: 0,
+  speed: FALL_SPEED_START,
+  gridScroll: 0,
+  sharedNextSpawnAt: 0,
+  particles: [],
+  shakeStartTime: -Infinity,
+  scorePopStartTime: -Infinity,
+  phaseAnnounceStartTime: -Infinity,
+  phaseAnnounceText: "",
+  hitstopStartTime: -Infinity,
+  deathInfo: null,
+  muted: localStorage.getItem(STORAGE_KEY_MUTED) === "true",
+  sides: {
+    left: createSideState(SIDE.LEFT),
+    right: createSideState(SIDE.RIGHT),
+  },
+};
+
+let audioCtx = null;
+let masterGain = null;
+
+/* ---------------------------------------------------------------------------
+   UTILITIES
+   ------------------------------------------------------------------------- */
+
+/** Clamps v to the [min, max] range. */
+function clamp(v, min, max) {
+  return Math.min(Math.max(v, min), max);
+}
+
+/** Linearly interpolates between a and b by t (t is not clamped). */
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+/** Returns a random float in [min, max). */
+function rand(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+/** Standard ease-out-cubic curve, used for the lane-switch tween. */
+function easeOutCubic(t) {
+  return 1 - Math.pow(1 - t, 3);
+}
+
+/** Width in px of a single panel (half the viewport). */
+function panelWidth() {
+  return state.viewWidth / 2;
+}
+
+/** X coordinate of the left edge of the given panel. */
+function panelX0(sideKey) {
+  if (sideKey === SIDE.RIGHT) {
+    return panelWidth();
+  }
+  return 0;
+}
+
+/** Width in px of a single lane (half a panel). */
+function laneWidthPx() {
+  return panelWidth() / 2;
+}
+
+/**
+ * Converts a (possibly fractional, mid-tween) lane position into an absolute
+ * screen x coordinate within the given panel. laneFloat 0 = left lane
+ * center, 1 = right lane center; values in between render mid-switch.
+ */
+function getLaneX(sideKey, laneFloat) {
+  return panelX0(sideKey) + laneWidthPx() * (laneFloat + 0.5);
+}
+
+/** Y coordinate of the character row, shared by both panels. */
+function characterY() {
+  return state.viewHeight * CHARACTER_Y_RATIO;
+}
+
+/** Returns the theme color associated with a side (cyan left, amber right). */
+function sideColor(sideKey) {
+  if (sideKey === SIDE.RIGHT) {
+    return COLOR_RIGHT;
+  }
+  return COLOR_LEFT;
+}
+
+/**
+ * Scales a reference (1200px-viewport) font size to the current viewport
+ * width, clamped so text never gets illegibly small on phones or absurdly
+ * large on ultrawide monitors.
+ */
+function scaledFontPx(basePx) {
+  const scale = clamp(state.viewWidth / 1200, 0.62, 1.15);
+  return Math.round(basePx * scale);
+}
+
+/** Builds a canvas font string ("weight size family") at the current scale. */
+function fontString(weight, basePx) {
+  return `${weight} ${scaledFontPx(basePx)}px ${FONT_STACK}`;
+}
+
+/**
+ * Traces a rounded-rectangle path. Canvas has no built-in rounded rect, so
+ * this is used for the character chip and the game-over panel.
+ */
+function drawRoundedRectPath(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+/** Draws horizontally- and vertically-centered text at (cx, y). */
+function drawCenterText(text, cx, y, font, color) {
+  ctx.font = font;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = color;
+  ctx.fillText(text, cx, y);
+}
+
+/**
+ * Like drawCenterText, but shrinks the font so the line never exceeds
+ * maxWidth. Used for prose lines (subtitle, instructions, prompts) that
+ * would otherwise overflow narrow phone screens.
+ */
+function drawFittedCenterText(text, cx, y, weight, basePx, color, maxWidth) {
+  let fontPx = scaledFontPx(basePx);
+  ctx.font = `${weight} ${fontPx}px ${FONT_STACK}`;
+  const width = ctx.measureText(text).width;
+  if (width > maxWidth) {
+    // Canvas text width scales linearly with font size, so a single
+    // proportional shrink lands exactly on maxWidth.
+    fontPx = Math.floor(fontPx * (maxWidth / width));
+    ctx.font = `${weight} ${fontPx}px ${FONT_STACK}`;
+  }
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = color;
+  ctx.fillText(text, cx, y);
+}
+
+/**
+ * True when the device's primary pointer is coarse (phones/tablets), which
+ * is when the menu should show touch-only instructions. Evaluated at call
+ * time rather than cached so DevTools device emulation and convertibles
+ * switching modes take effect without a reload.
+ */
+function detectTouchDevice() {
+  return window.matchMedia("(pointer: coarse)").matches;
+}
+
+/**
+ * Draws text centered at (cx, y) with manual letter-spacing. Canvas's
+ * ctx.letterSpacing support is inconsistent across browsers, so spacing is
+ * done by hand: measure and place each character individually. Tracking
+ * scales with the rendered glyph size, and when maxWidth is given the whole
+ * line is shrunk proportionally to fit it — this is what keeps the title
+ * and prompts on a single line on narrow phone screens.
+ */
+function drawTrackedText(text, cx, y, weight, basePx, color, spacing, maxWidth) {
+  let fontPx = scaledFontPx(basePx);
+  let spacingPx = spacing * (fontPx / basePx);
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "left";
+  ctx.font = `${weight} ${fontPx}px ${FONT_STACK}`;
+  let totalWidth = 0;
+  for (const ch of text) {
+    totalWidth += ctx.measureText(ch).width + spacingPx;
+  }
+  totalWidth -= spacingPx;
+  if (maxWidth && totalWidth > maxWidth) {
+    // Canvas text width scales linearly with font size, so a single
+    // proportional shrink of font and tracking lands exactly on maxWidth.
+    const fitScale = maxWidth / totalWidth;
+    fontPx *= fitScale;
+    spacingPx *= fitScale;
+    totalWidth = maxWidth;
+    ctx.font = `${weight} ${fontPx}px ${FONT_STACK}`;
+  }
+  let x = cx - totalWidth / 2;
+  ctx.fillStyle = color;
+  for (const ch of text) {
+    ctx.fillText(ch, x, y);
+    x += ctx.measureText(ch).width + spacingPx;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   AUDIO
+   Tiny procedural WebAudio blips; no audio files. The AudioContext is
+   created lazily on the first user input to satisfy browser autoplay
+   policies, which block audio until a user gesture occurs.
+   ------------------------------------------------------------------------- */
+
+/** Creates the shared AudioContext and master gain node, once, on demand. */
+function ensureAudioContext() {
+  if (audioCtx) {
+    // iOS suspends the context when the page is backgrounded; resume it on
+    // the next user input so sound comes back without a reload.
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume();
+    }
+    return;
+  }
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) {
+    return;
+  }
+  audioCtx = new AudioContextClass();
+  masterGain = audioCtx.createGain();
+  masterGain.gain.value = state.muted ? 0 : 1;
+  masterGain.connect(audioCtx.destination);
+}
+
+/**
+ * Plays a single short envelope-shaped tone. This is the building block for
+ * every sound effect in the game (switch tick, collect blip, death thud).
+ * Skips silently if the audio context isn't ready yet or the game is muted.
+ */
+function playTone(freq, durationS, type, peakGain) {
+  if (!audioCtx || state.muted) {
+    return;
+  }
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  const now = audioCtx.currentTime;
+  // Quick linear attack then exponential decay reads as a "blip" rather than
+  // a harsh on/off click.
+  gain.gain.setValueAtTime(0, now);
+  gain.gain.linearRampToValueAtTime(peakGain, now + 0.008);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + durationS);
+  osc.connect(gain);
+  gain.connect(masterGain);
+  osc.start(now);
+  osc.stop(now + durationS + 0.02);
+}
+
+/** Short tick played on every lane switch. */
+function playSwitchSound() {
+  playTone(AUDIO_SWITCH_FREQ, 0.05, "square", 0.05);
+}
+
+/** Pleasant blip on orb collect; pitch rises slightly with score/combo. */
+function playCollectSound() {
+  const comboScore = Math.min(state.score, AUDIO_COLLECT_SCORE_CAP);
+  const freq = AUDIO_COLLECT_BASE_FREQ + comboScore * AUDIO_COLLECT_FREQ_STEP;
+  playTone(freq, 0.12, "sine", 0.08);
+}
+
+/** Low thud played on death. */
+function playDeathSound() {
+  playTone(AUDIO_DEATH_FREQ, 0.35, "triangle", 0.12);
+}
+
+/** Flips the mute flag, persists it, and applies it to the live audio graph. */
+function toggleMute() {
+  state.muted = !state.muted;
+  localStorage.setItem(STORAGE_KEY_MUTED, String(state.muted));
+  if (masterGain) {
+    masterGain.gain.value = state.muted ? 0 : 1;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   INPUT
+   Keyboard: F/J toggle left/right lane, A/D and Left/Right arrows set the
+   left/right lane explicitly, M mutes. Pointer: tap/click left or right half
+   of the screen to toggle that side. Any input on the menu or game-over
+   screen (except M) starts/restarts the run.
+   ------------------------------------------------------------------------- */
+
+/** Swaps a side's logical lane (0 <-> 1) via setLane, kicking off the tween. */
+function toggleLane(side) {
+  const nextLane = side.lane === 0 ? 1 : 0;
+  setLane(side, nextLane);
+}
+
+/**
+ * Sets a side's logical lane immediately (collision-relevant state changes
+ * this frame) while kicking off a short visual tween so the character glides
+ * rather than teleports. No-ops outside PLAYING and when already in that
+ * lane, so repeated A/D or tap input doesn't restart the squash animation
+ * pointlessly.
+ */
+function setLane(side, lane) {
+  if (state.mode !== GAME_MODE.PLAYING) {
+    return;
+  }
+  if (side.lane === lane) {
+    return;
+  }
+  const now = performance.now();
+  side.lane = lane;
+  side.tweenFromLane = side.displayLane;
+  side.tweenStartTime = now;
+  side.tweening = true;
+  side.lastSwitchTime = now;
+  side.squashStartTime = now;
+  playSwitchSound();
+}
+
+/** Routes a keypress that occurred while a run is in progress. */
+function handlePlayingKey(key) {
+  switch (key) {
+    case "f":
+    case "F":
+      toggleLane(state.sides.left);
+      break;
+    case "j":
+    case "J":
+      toggleLane(state.sides.right);
+      break;
+    case "a":
+    case "A":
+      setLane(state.sides.left, 0);
+      break;
+    case "d":
+    case "D":
+      setLane(state.sides.left, 1);
+      break;
+    case "ArrowLeft":
+      setLane(state.sides.right, 0);
+      break;
+    case "ArrowRight":
+      setLane(state.sides.right, 1);
+      break;
+    default:
+      break;
+  }
+}
+
+/**
+ * Top-level keydown handler. M always toggles mute without side effects; on
+ * the menu/game-over screens any other key starts/restarts the run; during
+ * play, keys are routed to handlePlayingKey.
+ */
+function handleKeyDown(e) {
+  // Ignore OS key auto-repeat: without this, holding a key at the moment of
+  // death would skip straight past the game-over screen (a repeat fires
+  // ~30ms after it appears), and holding M would rapid-fire the mute toggle.
+  if (e.repeat) {
+    return;
+  }
+  ensureAudioContext();
+  const key = e.key;
+  if (key === "m" || key === "M") {
+    toggleMute();
+    return;
+  }
+  switch (state.mode) {
+    case GAME_MODE.MENU:
+    case GAME_MODE.GAMEOVER:
+      startGame();
+      return;
+    case GAME_MODE.PLAYING:
+      handlePlayingKey(key);
+      return;
+    default:
+      return;
+  }
+}
+
+/**
+ * Top-level pointer (mouse/touch) handler. On the menu/game-over screens any
+ * tap starts/restarts the run; during play, tapping the left or right half
+ * of the screen toggles that side's lane, mirroring the F/J keys.
+ */
+function handlePointerDown(e) {
+  e.preventDefault();
+  ensureAudioContext();
+  // The speaker icon's corner region always toggles mute, in every mode —
+  // touch devices have no M key, so this is their only mute control.
+  if (e.clientX >= state.viewWidth - MUTE_TAP_REGION_PX && e.clientY <= MUTE_TAP_REGION_PX) {
+    toggleMute();
+    return;
+  }
+  switch (state.mode) {
+    case GAME_MODE.MENU:
+    case GAME_MODE.GAMEOVER:
+      startGame();
+      return;
+    case GAME_MODE.PLAYING: {
+      const x = e.clientX;
+      if (x < state.viewWidth / 2) {
+        toggleLane(state.sides.left);
+      } else {
+        toggleLane(state.sides.right);
+      }
+      return;
+    }
+    default:
+      return;
+  }
+}
+
+window.addEventListener("keydown", handleKeyDown);
+canvas.addEventListener("pointerdown", handlePointerDown, { passive: false });
+// Belt-and-suspenders against mobile scroll/zoom gestures; touch-action:none
+// on the canvas is the primary defense, this blocks any residual drag-scroll.
+canvas.addEventListener("touchmove", (e) => {
+  e.preventDefault();
+}, { passive: false });
+
+/* ---------------------------------------------------------------------------
+   SPAWNER
+   Creates falling entities according to the current difficulty phase. The
+   feasibility guard (computeSpawnInterval) and the one-entity-per-spawn-event
+   design together guarantee a run can never be lost to an impossible
+   pattern: no two entities requiring conflicting lane choices ever occupy
+   the same height on the same side.
+   ------------------------------------------------------------------------- */
+
+/** Creates a new falling entity of the given type in the given lane. */
+function createEntity(type, lane) {
+  return { type, lane, y: ENTITY_SPAWN_Y };
+}
+
+/**
+ * Computes the delay before the next spawn on a clock. The base interval
+ * shrinks as fall speed ramps up, keeping perceived entity density roughly
+ * constant, but is always floored by the feasibility gap (interpolated
+ * between FEASIBILITY_MIN_GAP_START_MS and FEASIBILITY_MIN_GAP_MIN_MS by
+ * current speed). That floor is what guarantees consecutive entities on one
+ * side are never closer together, in time, than a player can react to.
+ */
+function computeSpawnInterval() {
+  const speedT = clamp((state.speed - FALL_SPEED_START) / (FALL_SPEED_CAP - FALL_SPEED_START), 0, 1);
+  const feasibilityGapMs = lerp(FEASIBILITY_MIN_GAP_START_MS, FEASIBILITY_MIN_GAP_MIN_MS, speedT);
+  const baseIntervalMs = lerp(SPAWN_INTERVAL_START_MS, SPAWN_INTERVAL_MIN_MS, speedT);
+  const floorMs = Math.max(baseIntervalMs, feasibilityGapMs);
+  return floorMs + rand(0, floorMs * SPAWN_JITTER_RATIO);
+}
+
+/**
+ * Phase-1 spawn: both panels receive an entity of the identical type at the
+ * identical moment, in lanes that mirror across the center divider (the
+ * "inner" lane, next to the divider, of one panel pairs with the "inner"
+ * lane of the other). This lets a single mental pattern drive both hands.
+ */
+function spawnMirrored() {
+  const type = Math.random() < SQUARE_SPAWN_WEIGHT ? ENTITY_TYPE.SQUARE : ENTITY_TYPE.ORB;
+  const innerIsLeftLane1 = Math.random() < 0.5;
+  // Left panel lane 1 (right side of left panel) sits against the divider,
+  // same for right panel lane 0 (left side of right panel) - those two are
+  // the "inner" pair.
+  const leftLane = innerIsLeftLane1 ? 1 : 0;
+  const rightLane = innerIsLeftLane1 ? 0 : 1;
+  state.sides.left.entities.push(createEntity(type, leftLane));
+  state.sides.right.entities.push(createEntity(type, rightLane));
+}
+
+/**
+ * Spawns exactly one entity of random type and lane on one side. Used by
+ * phases 2 and 3. Creating only a single entity per spawn event is what
+ * structurally prevents a square+square (both lanes blocked) or square+orb
+ * conflict from ever existing at the same height on the same side.
+ */
+function spawnIndependent(side) {
+  const type = Math.random() < SQUARE_SPAWN_WEIGHT ? ENTITY_TYPE.SQUARE : ENTITY_TYPE.ORB;
+  const lane = Math.random() < 0.5 ? 0 : 1;
+  side.entities.push(createEntity(type, lane));
+}
+
+/**
+ * Fires spawns per the current phase's timing rule: phases 1-2 share a
+ * single spawn clock (both sides always spawn in the same instant), phase 3
+ * gives each side its own independent clock (full timing desync). Every
+ * scheduled delay comes from computeSpawnInterval.
+ */
+function updateSpawning(now) {
+  switch (state.phase) {
+    case 1:
+      if (now >= state.sharedNextSpawnAt) {
+        spawnMirrored();
+        state.sharedNextSpawnAt = now + computeSpawnInterval();
+      }
+      break;
+    case 2:
+      if (now >= state.sharedNextSpawnAt) {
+        spawnIndependent(state.sides.left);
+        spawnIndependent(state.sides.right);
+        state.sharedNextSpawnAt = now + computeSpawnInterval();
+      }
+      break;
+    case 3:
+      if (now >= state.sides.left.nextSpawnAt) {
+        spawnIndependent(state.sides.left);
+        state.sides.left.nextSpawnAt = now + computeSpawnInterval();
+      }
+      if (now >= state.sides.right.nextSpawnAt) {
+        spawnIndependent(state.sides.right);
+        state.sides.right.nextSpawnAt = now + computeSpawnInterval();
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   UPDATE
+   ------------------------------------------------------------------------- */
+
+/** Evaluates the asymptotic fall-speed curve at a given elapsed run time. */
+function computeFallSpeed(elapsedS) {
+  return FALL_SPEED_CAP - (FALL_SPEED_CAP - FALL_SPEED_START) * Math.exp(-elapsedS / SPEED_RAMP_TAU_S);
+}
+
+/**
+ * Adds points, triggers the score "pop" juice animation, and re-evaluates
+ * the difficulty phase (score is the sole driver of phase progression).
+ */
+function incrementScore(amount, now) {
+  state.score += amount;
+  state.scorePopStartTime = now;
+  updatePhase(now);
+}
+
+/**
+ * Determines which of the three phases the run is in based on score alone,
+ * and announces the transition. Entering phase 3 switches spawning from one
+ * shared clock to two independent per-side clocks, so it seeds both sides'
+ * next-spawn timers immediately to avoid a burst or a stall at the switch.
+ */
+function updatePhase(now) {
+  let nextPhase = 1;
+  if (state.score >= PHASE3_SCORE_THRESHOLD) {
+    nextPhase = 3;
+  } else if (state.score >= PHASE2_SCORE_THRESHOLD) {
+    nextPhase = 2;
+  }
+  if (nextPhase === state.phase) {
+    return;
+  }
+  state.phase = nextPhase;
+  state.phaseAnnounceStartTime = now;
+  state.phaseAnnounceText = PHASE_ANNOUNCE_TEXT[nextPhase] || "";
+  if (nextPhase === 3) {
+    state.sides.left.nextSpawnAt = now + computeSpawnInterval();
+    state.sides.right.nextSpawnAt = now + computeSpawnInterval();
+  }
+}
+
+/** Spawns a radial burst of particles, used for collects, deaths, and near-misses. */
+function spawnParticleBurst(x, y, color, count, big) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speedMag = big ? rand(120, 420) : rand(40, 160);
+    const life = big ? rand(0.4, 0.8) : rand(0.25, 0.5);
+    state.particles.push({
+      x,
+      y,
+      vx: Math.cos(angle) * speedMag,
+      vy: Math.sin(angle) * speedMag,
+      life,
+      maxLife: life,
+      color,
+      size: big ? rand(2, 5) : rand(1.5, 3.5),
+    });
+  }
+}
+
+/** Integrates particle physics (gravity + velocity) and prunes dead ones. */
+function updateParticles(dt) {
+  for (let i = state.particles.length - 1; i >= 0; i--) {
+    const p = state.particles[i];
+    p.vy += PARTICLE_GRAVITY * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.life -= dt;
+    if (p.life <= 0) {
+      state.particles.splice(i, 1);
+    }
+  }
+}
+
+/** Advances a side's lane-switch tween toward its target, then snaps and stops. */
+function updateSideTween(side, now) {
+  if (!side.tweening) {
+    return;
+  }
+  const t = clamp((now - side.tweenStartTime) / LANE_SWITCH_TWEEN_MS, 0, 1);
+  side.displayLane = lerp(side.tweenFromLane, side.lane, easeOutCubic(t));
+  if (t >= 1) {
+    side.tweening = false;
+    side.displayLane = side.lane;
+  }
+}
+
+/**
+ * Ends a run the instant a side dies (square contact or missed orb). Enters
+ * a brief hitstop freeze-frame before the game-over screen appears, and
+ * kicks off the death particle explosion, screen shake, and thud sound.
+ */
+function triggerDeath(side, reasonText, now) {
+  if (state.mode !== GAME_MODE.PLAYING) {
+    return;
+  }
+  state.mode = GAME_MODE.HITSTOP;
+  state.hitstopStartTime = now;
+  state.deathInfo = { sideKey: side.key, reason: reasonText };
+  const x = getLaneX(side.key, side.lane);
+  spawnParticleBurst(x, characterY(), sideColor(side.key), PARTICLE_DEATH_COUNT, true);
+  state.shakeStartTime = now;
+  playDeathSound();
+}
+
+/**
+ * Advances every falling entity on one side by dt and resolves collisions,
+ * collections, dodges, and misses. Resolution is checked every frame while
+ * an entity overlaps the character's row (COLLIDE_BAND_PX tall), not just
+ * once, so switching lanes mid-band still correctly registers a hit or a
+ * catch - matching the "lane switching is instant" rule.
+ */
+function updateEntities(side, dt, now) {
+  const charY = characterY();
+  const bandTop = charY - COLLIDE_BAND_PX;
+  const bandBottom = charY + COLLIDE_BAND_PX;
+  const entities = side.entities;
+  for (let i = entities.length - 1; i >= 0; i--) {
+    const entity = entities[i];
+    entity.y += state.speed * dt;
+    const inBand = entity.y >= bandTop && entity.y <= bandBottom;
+    const sameLane = entity.lane === side.lane;
+
+    if (inBand && sameLane) {
+      if (entity.type === ENTITY_TYPE.SQUARE) {
+        entities.splice(i, 1);
+        triggerDeath(side, "hit a square", now);
+        return; // run over: stop processing this side further this frame
+      }
+      entities.splice(i, 1);
+      spawnParticleBurst(getLaneX(side.key, side.lane), charY, sideColor(side.key), PARTICLE_COLLECT_COUNT, false);
+      playCollectSound();
+      incrementScore(1, now);
+      continue;
+    }
+
+    if (entity.y > bandBottom) {
+      // The entity has fully passed the character's row without a lane
+      // match ever having occurred.
+      if (entity.type === ENTITY_TYPE.SQUARE) {
+        entities.splice(i, 1);
+        incrementScore(1, now);
+        // A dodge counts as a "near miss" flourish if the player switched
+        // away from this square's lane only moments before it arrived.
+        if (now - side.lastSwitchTime < NEAR_MISS_WINDOW_MS) {
+          spawnParticleBurst(getLaneX(side.key, side.lane), charY, COLOR_NEAR_MISS_SPARK, PARTICLE_NEAR_MISS_COUNT, false);
+        }
+        continue;
+      }
+      entities.splice(i, 1);
+      triggerDeath(side, "missed an orb", now);
+      return;
+    }
+  }
+}
+
+/** Per-frame update while a run is actively in progress. */
+function updatePlaying(dt, now) {
+  state.elapsed += dt;
+  state.speed = computeFallSpeed(state.elapsed);
+  state.gridScroll += state.speed * dt;
+  updateSpawning(now);
+  updateSideTween(state.sides.left, now);
+  updateSideTween(state.sides.right, now);
+  updateEntities(state.sides.left, dt, now);
+  if (state.mode !== GAME_MODE.PLAYING) {
+    return; // left side died this frame; don't also process the right side
+  }
+  updateEntities(state.sides.right, dt, now);
+  updateParticles(dt);
+}
+
+/** Counts down the death freeze-frame, then hands off to finalizeGameOver. */
+function updateHitstop(dt, now) {
+  updateParticles(dt);
+  if (now - state.hitstopStartTime >= HITSTOP_DURATION_MS) {
+    finalizeGameOver();
+  }
+}
+
+/** Resets one side's per-run state (lane, tween, entities, spawn clock). */
+function resetSide(side, now) {
+  side.lane = 0;
+  side.displayLane = 0;
+  side.tweening = false;
+  side.tweenFromLane = 0;
+  side.tweenStartTime = now;
+  side.squashStartTime = -Infinity;
+  side.lastSwitchTime = -Infinity;
+  side.entities = [];
+  side.nextSpawnAt = now + computeSpawnInterval();
+}
+
+/**
+ * (Re)initializes all run-scoped state and enters PLAYING mode. Reachable
+ * from the menu or the game-over screen via any key press or tap.
+ */
+function startGame() {
+  const now = performance.now();
+  state.mode = GAME_MODE.PLAYING;
+  state.score = 0;
+  state.phase = 1;
+  state.elapsed = 0;
+  state.speed = FALL_SPEED_START;
+  state.particles = [];
+  state.deathInfo = null;
+  state.shakeStartTime = -Infinity;
+  state.scorePopStartTime = -Infinity;
+  state.phaseAnnounceStartTime = -Infinity;
+  state.phaseAnnounceText = "";
+  state.sharedNextSpawnAt = now + computeSpawnInterval();
+  resetSide(state.sides.left, now);
+  resetSide(state.sides.right, now);
+}
+
+/**
+ * Ends the hitstop freeze and moves into the GAMEOVER screen, updating and
+ * persisting the high score if this run beat it.
+ */
+function finalizeGameOver() {
+  state.mode = GAME_MODE.GAMEOVER;
+  state.isNewBest = false;
+  if (state.score > state.highScore) {
+    state.highScore = state.score;
+    state.isNewBest = true;
+    localStorage.setItem(STORAGE_KEY_HIGHSCORE, String(state.highScore));
+  }
+}
+
+/** Top-level per-frame update dispatcher, one branch per game mode. */
+function update(dt, now) {
+  switch (state.mode) {
+    case GAME_MODE.MENU:
+      state.gridScroll += MENU_GRID_SCROLL_SPEED * dt;
+      break;
+    case GAME_MODE.PLAYING:
+      updatePlaying(dt, now);
+      break;
+    case GAME_MODE.HITSTOP:
+      updateHitstop(dt, now);
+      break;
+    case GAME_MODE.GAMEOVER:
+      updateParticles(dt);
+      break;
+    default:
+      break;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   RENDER
+   ------------------------------------------------------------------------- */
+
+/** Fills the full canvas with the base background color. */
+function drawBackground() {
+  ctx.fillStyle = COLOR_BG;
+  ctx.fillRect(0, 0, state.viewWidth, state.viewHeight);
+}
+
+/**
+ * Draws a faint grid of horizontal lines scrolling down one panel, whose
+ * scroll speed tracks the current fall speed - a cheap way to convey
+ * velocity without per-frame allocations.
+ */
+function drawPanelGrid(sideKey) {
+  const x0 = panelX0(sideKey);
+  const w = panelWidth();
+  const offset = state.gridScroll % GRID_LINE_SPACING_PX;
+  ctx.strokeStyle = COLOR_BG_GRID;
+  ctx.lineWidth = 1;
+  for (let y = -GRID_LINE_SPACING_PX + offset; y < state.viewHeight; y += GRID_LINE_SPACING_PX) {
+    ctx.beginPath();
+    ctx.moveTo(x0, y);
+    ctx.lineTo(x0 + w, y);
+    ctx.stroke();
+  }
+}
+
+/** Draws the thin glowing vertical divider separating the two panels. */
+function drawDivider() {
+  const x = panelWidth();
+  ctx.save();
+  ctx.shadowColor = COLOR_DIVIDER;
+  ctx.shadowBlur = 10;
+  ctx.strokeStyle = COLOR_DIVIDER;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x, 0);
+  ctx.lineTo(x, state.viewHeight);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/** Draws a single falling square obstacle with a soft glow. */
+function drawSquareEntity(x, y) {
+  ctx.save();
+  ctx.shadowColor = COLOR_SQUARE;
+  ctx.shadowBlur = 12;
+  ctx.fillStyle = COLOR_SQUARE;
+  const half = SQUARE_SIZE / 2;
+  ctx.fillRect(x - half, y - half, SQUARE_SIZE, SQUARE_SIZE);
+  ctx.restore();
+}
+
+/** Draws a single falling orb, colored to match its panel's character. */
+function drawOrbEntity(x, y, color) {
+  ctx.save();
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 14;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(x, y, ORB_RADIUS, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+/** Dispatches drawing for one entity based on its type. */
+function drawEntity(entity, sideKey) {
+  const x = getLaneX(sideKey, entity.lane);
+  switch (entity.type) {
+    case ENTITY_TYPE.SQUARE:
+      drawSquareEntity(x, entity.y);
+      break;
+    case ENTITY_TYPE.ORB:
+      drawOrbEntity(x, entity.y, sideColor(sideKey));
+      break;
+    default:
+      break;
+  }
+}
+
+/** Draws every falling entity currently on one side. */
+function drawSideEntities(side) {
+  for (const entity of side.entities) {
+    drawEntity(entity, side.key);
+  }
+}
+
+/**
+ * Draws one character as a glowing rounded chip, applying a brief
+ * squash/stretch pulse right after a lane switch for extra juice.
+ */
+function drawCharacter(side, now) {
+  const x = getLaneX(side.key, side.displayLane);
+  const y = characterY();
+  const color = sideColor(side.key);
+  const squashElapsed = now - side.squashStartTime;
+  let scaleX = 1;
+  let scaleY = 1;
+  if (squashElapsed < SQUASH_DURATION_MS) {
+    const t = 1 - squashElapsed / SQUASH_DURATION_MS;
+    scaleX = 1 + t * 0.22;
+    scaleY = 1 - t * 0.18;
+  }
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(scaleX, scaleY);
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 16;
+  ctx.fillStyle = color;
+  drawRoundedRectPath(-CHARACTER_SIZE / 2, -CHARACTER_SIZE / 2, CHARACTER_SIZE, CHARACTER_SIZE, 9);
+  ctx.fill();
+  ctx.restore();
+}
+
+/** Draws every live particle as a fading filled circle. */
+function drawParticles() {
+  for (const p of state.particles) {
+    const alpha = clamp(p.life / p.maxLife, 0, 1);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+/** Computes the current camera-shake offset from the shake start time. */
+function getShakeOffset(now) {
+  const elapsed = now - state.shakeStartTime;
+  if (elapsed >= SHAKE_DURATION_MS) {
+    return { x: 0, y: 0 };
+  }
+  const t = 1 - elapsed / SHAKE_DURATION_MS;
+  const magnitude = SHAKE_MAGNITUDE_PX * t;
+  return { x: rand(-magnitude, magnitude), y: rand(-magnitude, magnitude) };
+}
+
+/** Draws a radial vignette darkening the screen edges for visual depth. */
+function drawVignette() {
+  const grad = ctx.createRadialGradient(
+    state.viewWidth / 2, state.viewHeight / 2, state.viewHeight * 0.3,
+    state.viewWidth / 2, state.viewHeight / 2, state.viewHeight * 0.75
+  );
+  grad.addColorStop(0, "rgba(0, 0, 0, 0)");
+  grad.addColorStop(1, COLOR_VIGNETTE);
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, state.viewWidth, state.viewHeight);
+}
+
+/** Draws a small procedural speaker icon (with a mute slash when muted). */
+function drawMuteIndicator() {
+  const cx = state.viewWidth - 32;
+  const cy = 30;
+  ctx.save();
+  ctx.strokeStyle = COLOR_TEXT_DIM;
+  ctx.fillStyle = COLOR_TEXT_DIM;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(cx - 10, cy - 5);
+  ctx.lineTo(cx - 4, cy - 5);
+  ctx.lineTo(cx + 4, cy - 11);
+  ctx.lineTo(cx + 4, cy + 11);
+  ctx.lineTo(cx - 4, cy + 5);
+  ctx.lineTo(cx - 10, cy + 5);
+  ctx.closePath();
+  ctx.fill();
+  if (state.muted) {
+    ctx.beginPath();
+    ctx.moveTo(cx + 9, cy - 9);
+    ctx.lineTo(cx + 17, cy + 9);
+    ctx.moveTo(cx + 17, cy - 9);
+    ctx.lineTo(cx + 9, cy + 9);
+    ctx.stroke();
+  } else {
+    ctx.beginPath();
+    ctx.arc(cx + 9, cy, 6, -0.6, 0.6);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cx + 9, cy, 11, -0.7, 0.7);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/** Draws the top-center score readout (with its "pop" juice) and mute icon. */
+function drawHud(now) {
+  const popElapsed = now - state.scorePopStartTime;
+  let scale = 1;
+  if (popElapsed < SCORE_POP_DURATION_MS) {
+    scale = 1 + (1 - popElapsed / SCORE_POP_DURATION_MS) * 0.35;
+  }
+  ctx.save();
+  ctx.translate(state.viewWidth / 2, 56);
+  ctx.scale(scale, scale);
+  drawCenterText(String(state.score), 0, 0, fontString(800, FONT_HUD_SCORE_BASE_PX), COLOR_TEXT);
+  ctx.restore();
+  drawMuteIndicator();
+}
+
+/** Draws the title screen: title, premise, controls, and high score. */
+function drawMenu() {
+  const cx = state.viewWidth / 2;
+  const maxLineWidth = state.viewWidth * 0.92;
+  const isTouch = detectTouchDevice();
+  drawTrackedText("TWO LANES, ONE BRAIN", cx, state.viewHeight * 0.26, 800, FONT_TITLE_BASE_PX, COLOR_TEXT, 6, maxLineWidth);
+  drawFittedCenterText(
+    "One brain, two hands: dodge the squares and catch the orbs, on both sides at once.",
+    cx, state.viewHeight * 0.26 + 44, 400, FONT_SUBTITLE_BASE_PX, COLOR_TEXT_DIM, maxLineWidth
+  );
+
+  // Touch devices get touch-only instructions; keyboard hints would be noise
+  // on a phone, and the M key doesn't exist there (the speaker icon does).
+  let lines;
+  if (isTouch) {
+    lines = [
+      "Tap the left or right half of the screen to switch that side's lane",
+      "Tap the speaker in the top-right corner to mute",
+    ];
+  } else {
+    lines = [
+      "F  /  J  —  toggle the left / right character's lane",
+      "A D  and  ←  →  —  set the left / right lane directly",
+      "Tap the left or right half of the screen  —  same thing, for touch",
+      "M  —  mute sound",
+    ];
+  }
+  const linesY = state.viewHeight * 0.48;
+  for (let i = 0; i < lines.length; i++) {
+    drawFittedCenterText(lines[i], cx, linesY + i * 28, 400, FONT_BODY_BASE_PX, COLOR_TEXT_DIM, maxLineWidth);
+  }
+
+  drawCenterText(`BEST  ${state.highScore}`, cx, state.viewHeight * 0.7, fontString(700, FONT_BODY_BOLD_BASE_PX), COLOR_TEXT);
+
+  let promptText;
+  if (isTouch) {
+    promptText = "TAP TO START";
+  } else {
+    promptText = "PRESS ANY KEY OR TAP TO START";
+  }
+  const blink = 0.5 + 0.5 * Math.sin(performance.now() / 260);
+  ctx.save();
+  ctx.globalAlpha = 0.4 + blink * 0.6;
+  drawTrackedText(promptText, cx, state.viewHeight * 0.8, 700, FONT_PROMPT_BASE_PX, COLOR_TEXT, 3, maxLineWidth);
+  ctx.restore();
+
+  // The mute tap-region is active on the menu too, so its icon must be
+  // visible here — an invisible dead zone that eats taps would feel broken.
+  drawMuteIndicator();
+}
+
+/** Draws the game-over panel: final score, best, cause of death, and restart hint. */
+function drawGameOverPanel() {
+  const cx = state.viewWidth / 2;
+  const cy = state.viewHeight / 2;
+  const panelW = Math.min(state.viewWidth * 0.86, 520);
+  const panelH = 300;
+
+  ctx.save();
+  ctx.fillStyle = COLOR_PANEL_BG;
+  drawRoundedRectPath(cx - panelW / 2, cy - panelH / 2, panelW, panelH, 18);
+  ctx.fill();
+  ctx.restore();
+
+  drawTrackedText("RUN OVER", cx, cy - panelH / 2 + 46, 800, FONT_GAMEOVER_TITLE_BASE_PX, COLOR_TEXT, 4, panelW * 0.9);
+  drawCenterText(`SCORE  ${state.score}`, cx, cy - 30, fontString(700, FONT_GAMEOVER_SCORE_BASE_PX), COLOR_TEXT);
+  drawCenterText(`BEST  ${state.highScore}`, cx, cy + 8, fontString(400, FONT_BODY_BASE_PX), COLOR_TEXT_DIM);
+
+  if (state.isNewBest) {
+    drawCenterText("NEW BEST", cx, cy + 38, fontString(800, FONT_BODY_BOLD_BASE_PX), sideColor(SIDE.LEFT));
+  }
+
+  if (state.deathInfo) {
+    const label = state.deathInfo.sideKey.toUpperCase();
+    drawCenterText(`${label}: ${state.deathInfo.reason}`, cx, cy + 68, fontString(400, FONT_BODY_BASE_PX), COLOR_TEXT_DIM);
+  }
+
+  let restartText;
+  if (detectTouchDevice()) {
+    restartText = "TAP TO RESTART";
+  } else {
+    restartText = "PRESS ANY KEY OR TAP TO RESTART";
+  }
+  const blink = 0.5 + 0.5 * Math.sin(performance.now() / 260);
+  ctx.save();
+  ctx.globalAlpha = 0.4 + blink * 0.6;
+  drawFittedCenterText(restartText, cx, cy + panelH / 2 - 28, 700, FONT_PROMPT_BASE_PX, COLOR_TEXT, panelW * 0.9);
+  ctx.restore();
+}
+
+/** Draws the brief fading phase-change announcement ("LANES SPLIT", etc). */
+function drawPhaseAnnounce(now) {
+  if (!state.phaseAnnounceText) {
+    return;
+  }
+  const elapsed = now - state.phaseAnnounceStartTime;
+  if (elapsed >= PHASE_ANNOUNCE_DURATION_MS) {
+    return;
+  }
+  const fadeIn = clamp(elapsed / 200, 0, 1);
+  const fadeOut = clamp((PHASE_ANNOUNCE_DURATION_MS - elapsed) / 300, 0, 1);
+  const alpha = Math.min(fadeIn, fadeOut);
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  drawTrackedText(state.phaseAnnounceText, state.viewWidth / 2, state.viewHeight * 0.16, 700, FONT_PHASE_ANNOUNCE_BASE_PX, COLOR_TEXT, 5, state.viewWidth * 0.92);
+  ctx.restore();
+}
+
+/** Top-level per-frame render dispatcher, one branch per game mode. */
+function render(now) {
+  const shake = getShakeOffset(now);
+  ctx.save();
+  ctx.translate(shake.x, shake.y);
+  drawBackground();
+  drawPanelGrid(SIDE.LEFT);
+  drawPanelGrid(SIDE.RIGHT);
+  drawDivider();
+  drawSideEntities(state.sides.left);
+  drawSideEntities(state.sides.right);
+  drawCharacter(state.sides.left, now);
+  drawCharacter(state.sides.right, now);
+  drawParticles();
+  ctx.restore();
+  drawVignette();
+
+  switch (state.mode) {
+    case GAME_MODE.MENU:
+      drawMenu();
+      break;
+    case GAME_MODE.PLAYING:
+    case GAME_MODE.HITSTOP:
+      drawHud(now);
+      break;
+    case GAME_MODE.GAMEOVER:
+      drawHud(now);
+      drawGameOverPanel();
+      break;
+    default:
+      break;
+  }
+  drawPhaseAnnounce(now);
+}
+
+/* ---------------------------------------------------------------------------
+   MAIN LOOP
+   ------------------------------------------------------------------------- */
+
+/**
+ * Resizes the canvas backing store to match devicePixelRatio so drawing
+ * stays crisp on high-DPI screens, while CSS keeps the on-screen size at
+ * the logical viewport size. Called on boot and on every window resize.
+ */
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  state.viewWidth = window.innerWidth;
+  state.viewHeight = window.innerHeight;
+  canvas.width = Math.round(state.viewWidth * dpr);
+  canvas.height = Math.round(state.viewHeight * dpr);
+  canvas.style.width = `${state.viewWidth}px`;
+  canvas.style.height = `${state.viewHeight}px`;
+  // All subsequent drawing uses logical (CSS) pixel coordinates; this
+  // transform maps them onto the higher-resolution backing store.
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+window.addEventListener("resize", resizeCanvas);
+// iOS Safari can resize the visual viewport (URL bar collapse, keyboard)
+// without firing a window resize, so track it directly where supported.
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", resizeCanvas);
+}
+
+let lastFrameTime = 0;
+
+/**
+ * The requestAnimationFrame loop. Delta-time is clamped (MAX_DT_S) so a
+ * background tab regaining focus after a long pause doesn't feed a huge dt
+ * into physics and teleport entities through the character row.
+ */
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (!lastFrameTime) {
+    lastFrameTime = now;
+  }
+  const dt = Math.min((now - lastFrameTime) / 1000, MAX_DT_S);
+  lastFrameTime = now;
+  update(dt, now);
+  render(now);
+}
+
+/* ---------------------------------------------------------------------------
+   BOOT
+   ------------------------------------------------------------------------- */
+
+resizeCanvas();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
